@@ -1,17 +1,7 @@
 import { useRef, useEffect, useState } from "react";
 import socket from "../socket";
 
-const RTC_CONFIG = {
-    iceServers: [
-        { urls: "stun:stun.l.google.com:19302" },
-        { urls: "stun:stun1.l.google.com:19302" },
-        { urls: "stun:stun2.l.google.com:19302" },
-        { urls: "stun:stun3.l.google.com:19302" },
-        { urls: "turn:openrelay.metered.ca:80", username: "openrelayproject", credential: "openrelayproject" },
-        { urls: "turn:openrelay.metered.ca:443", username: "openrelayproject", credential: "openrelayproject" },
-        { urls: "turn:openrelay.metered.ca:443?transport=tcp", username: "openrelayproject", credential: "openrelayproject" },
-    ],
-};
+const CHUNK_SIZE = 1 * 1024 * 1024;
 
 function formatTime(s) {
     if (!s || isNaN(s)) return "0:00";
@@ -20,12 +10,26 @@ function formatTime(s) {
     return `${m}:${sec.toString().padStart(2, "0")}`;
 }
 
+function getSupportedMime(file) {
+    const name = file.name.toLowerCase();
+    const candidates = name.endsWith(".webm")
+        ? ['video/webm; codecs="vp8, vorbis"', 'video/webm; codecs="vp9"', "video/webm"]
+        : ['video/mp4; codecs="avc1.42E01E, mp4a.40.2"', "video/mp4"];
+    for (const mime of candidates) {
+        if (MediaSource.isTypeSupported(mime)) return mime;
+    }
+    return "video/mp4";
+}
+
 export default function VideoPlayer({ currentUser, currentMovie, onMovieNameSet }) {
     const videoRef = useRef(null);
     const progressRef = useRef(null);
     const fileRef = useRef(null);
-    const peerConns = useRef({});
-    const viewerConn = useRef(null);
+    const mediaSourceRef = useRef(null);
+    const sourceBufferRef = useRef(null);
+    const chunkQueueRef = useRef([]);
+    const isAppendingRef = useRef(false);
+    const streamingRef = useRef(false);
 
     const [isPlaying, setIsPlaying] = useState(false);
     const [currentTime, setCurrentTime] = useState(0);
@@ -35,9 +39,9 @@ export default function VideoPlayer({ currentUser, currentMovie, onMovieNameSet 
     const [showControls, setShowControls] = useState(true);
     const [buffered, setBuffered] = useState(0);
     const [movieName, setMovieName] = useState(currentMovie?.name || null);
-    const [streamReady, setStreamReady] = useState(false);
-    const [loadingStream, setLoadingStream] = useState(false);
-    const [streamError, setStreamError] = useState(false);
+    const [viewerReady, setViewerReady] = useState(false);
+    const [viewerLoading, setViewerLoading] = useState(false);
+    const [loadingText, setLoadingText] = useState("Waiting for host...");
 
     const controlsTimer = useRef(null);
     const isHost = currentUser?.isHost;
@@ -45,9 +49,7 @@ export default function VideoPlayer({ currentUser, currentMovie, onMovieNameSet 
     function handleMouseMove() {
         setShowControls(true);
         clearTimeout(controlsTimer.current);
-        controlsTimer.current = setTimeout(() => {
-            if (isPlaying) setShowControls(false);
-        }, 3000);
+        controlsTimer.current = setTimeout(() => { if (isPlaying) setShowControls(false); }, 3000);
     }
 
     function handleFilePick(e) {
@@ -55,78 +57,43 @@ export default function VideoPlayer({ currentUser, currentMovie, onMovieNameSet 
         if (!file) return;
         fileRef.current = file;
         const url = URL.createObjectURL(file);
-        if (videoRef.current) {
-            videoRef.current.srcObject = null;
-            videoRef.current.src = url;
-            videoRef.current.load();
-        }
+        const v = videoRef.current;
+        if (v) { v.src = url; v.load(); }
         const name = file.name.replace(/\.[^/.]+$/, "").replace(/[._-]/g, " ");
+        const mimeType = getSupportedMime(file);
         setMovieName(name);
         onMovieNameSet?.(name);
-        socket.emit("host-set-movie", { movieName: name });
-        videoRef.current.onloadedmetadata = () => {
-            setDuration(videoRef.current.duration || 0);
-            Object.keys(peerConns.current).forEach((id) => createPeerForViewer(id));
-        };
+        socket.emit("host-set-movie", { movieName: name, mimeType });
+        streamFileToViewers(file, mimeType);
     }
 
-    async function createPeerForViewer(viewerId) {
-        if (peerConns.current[viewerId]) {
-            try { peerConns.current[viewerId].close(); } catch (e) {}
+    async function streamFileToViewers(file, mimeType) {
+        streamingRef.current = true;
+        let offset = 0;
+        while (offset < file.size && streamingRef.current) {
+            const end = Math.min(offset + CHUNK_SIZE, file.size);
+            const blob = file.slice(offset, end);
+            try {
+                const arrayBuffer = await blob.arrayBuffer();
+                const uint8 = new Uint8Array(arrayBuffer);
+                let binary = "";
+                for (let i = 0; i < uint8.length; i++) binary += String.fromCharCode(uint8[i]);
+                const base64 = btoa(binary);
+                socket.emit("video-chunk", { chunk: base64, mimeType });
+                offset = end;
+                await new Promise((r) => setTimeout(r, 50));
+            } catch (err) { console.error("Chunk error:", err); break; }
         }
-        const pc = new RTCPeerConnection(RTC_CONFIG);
-        peerConns.current[viewerId] = pc;
-
-        let stream;
-        try {
-            stream = videoRef.current.captureStream
-                ? videoRef.current.captureStream()
-                : videoRef.current.mozCaptureStream
-                    ? videoRef.current.mozCaptureStream()
-                    : null;
-        } catch (err) {
-            console.error("[WebRTC] captureStream error:", err);
-            return;
-        }
-
-        if (!stream || stream.getTracks().length === 0) {
-            console.warn("[WebRTC] No tracks yet, retrying in 1s");
-            setTimeout(() => createPeerForViewer(viewerId), 1000);
-            return;
-        }
-
-        stream.getTracks().forEach((t) => pc.addTrack(t, stream));
-
-        pc.onicecandidate = (e) => {
-            if (e.candidate) socket.emit("webrtc-ice", { targetId: viewerId, candidate: e.candidate });
-        };
-
-        pc.onconnectionstatechange = () => {
-            if (["failed", "closed"].includes(pc.connectionState)) delete peerConns.current[viewerId];
-        };
-
-        try {
-            const offer = await pc.createOffer();
-            await pc.setLocalDescription(offer);
-            socket.emit("webrtc-offer", { viewerId, offer });
-        } catch (err) {
-            console.error("[WebRTC] Offer error:", err);
-        }
+        if (streamingRef.current) socket.emit("video-chunk", { chunk: null, mimeType, done: true });
     }
 
     function togglePlay() {
         if (!isHost) return;
-        const v = videoRef.current;
-        if (!v) return;
+        const v = videoRef.current; if (!v) return;
         if (isPlaying) {
-            v.pause();
-            setIsPlaying(false);
-            socket.emit("host-pause", { currentTime: v.currentTime });
+            v.pause(); setIsPlaying(false); socket.emit("host-pause", { currentTime: v.currentTime });
         } else {
-            v.play().then(() => {
-                setIsPlaying(true);
-                socket.emit("host-play", { currentTime: v.currentTime });
-            }).catch(console.error);
+            v.play().then(() => { setIsPlaying(true); socket.emit("host-play", { currentTime: v.currentTime }); }).catch(console.error);
         }
     }
 
@@ -145,141 +112,81 @@ export default function VideoPlayer({ currentUser, currentMovie, onMovieNameSet 
         if (v.buffered.length > 0) setBuffered((v.buffered.end(v.buffered.length - 1) / v.duration) * 100);
     }
 
-    useEffect(() => {
-        if (!isHost) return;
+    function setupMediaSource(mimeType) {
+        const v = videoRef.current; if (!v) return;
+        chunkQueueRef.current = [];
+        isAppendingRef.current = false;
+        const ms = new MediaSource();
+        mediaSourceRef.current = ms;
+        v.src = URL.createObjectURL(ms);
+        ms.addEventListener("sourceopen", () => {
+            try {
+                const mime = MediaSource.isTypeSupported(mimeType) ? mimeType : "video/mp4";
+                const sb = ms.addSourceBuffer(mime);
+                sourceBufferRef.current = sb;
+                sb.addEventListener("updateend", () => { isAppendingRef.current = false; appendNextChunk(); });
+                appendNextChunk();
+                setViewerLoading(true);
+                setLoadingText("Buffering video...");
+            } catch (err) { console.error("MediaSource error:", err); setLoadingText("Format error. Host should use MP4."); }
+        });
+    }
 
-        function onViewerJoined({ viewerId, viewerName }) {
-            peerConns.current[viewerId] = null;
-            if (fileRef.current && videoRef.current?.src) createPeerForViewer(viewerId);
-        }
-
-        function onAnswer({ viewerId, answer }) {
-            const pc = peerConns.current[viewerId];
-            if (pc && pc.signalingState !== "stable") {
-                pc.setRemoteDescription(new RTCSessionDescription(answer)).catch(console.error);
+    function appendNextChunk() {
+        const sb = sourceBufferRef.current;
+        const ms = mediaSourceRef.current;
+        if (!sb || isAppendingRef.current || chunkQueueRef.current.length === 0 || sb.updating) return;
+        const item = chunkQueueRef.current.shift();
+        if (item.done) { try { if (ms.readyState === "open") ms.endOfStream(); } catch (e) {} return; }
+        try {
+            isAppendingRef.current = true;
+            sb.appendBuffer(item.data);
+            const v = videoRef.current;
+            if (v && v.buffered.length > 0 && v.buffered.end(0) > 3 && !viewerReady) {
+                setViewerReady(true); setViewerLoading(false);
             }
-        }
-
-        function onIce({ fromId, candidate }) {
-            const pc = peerConns.current[fromId];
-            if (pc) pc.addIceCandidate(new RTCIceCandidate(candidate)).catch(() => {});
-        }
-
-        function onPeerDisconnected({ peerId }) {
-            const pc = peerConns.current[peerId];
-            if (pc) { try { pc.close(); } catch (e) {} delete peerConns.current[peerId]; }
-        }
-
-        socket.on("viewer-joined", onViewerJoined);
-        socket.on("webrtc-answer", onAnswer);
-        socket.on("webrtc-ice", onIce);
-        socket.on("peer-disconnected", onPeerDisconnected);
-
-        return () => {
-            socket.off("viewer-joined", onViewerJoined);
-            socket.off("webrtc-answer", onAnswer);
-            socket.off("webrtc-ice", onIce);
-            socket.off("peer-disconnected", onPeerDisconnected);
-        };
-    }, [isHost]);
+        } catch (err) { console.error("appendBuffer error:", err); isAppendingRef.current = false; }
+    }
 
     useEffect(() => {
         if (isHost) return;
 
-        async function onOffer({ hostId, offer }) {
-            setLoadingStream(true);
-            setStreamError(false);
-            if (viewerConn.current) { try { viewerConn.current.close(); } catch (e) {} }
+        function onMovieSet({ movieName, mimeType }) {
+            setMovieName(movieName); setViewerReady(false); setViewerLoading(true); setLoadingText("Setting up stream...");
+            setupMediaSource(mimeType || "video/mp4");
+        }
 
-            const pc = new RTCPeerConnection(RTC_CONFIG);
-            viewerConn.current = pc;
-
-            pc.ontrack = (e) => {
-                const stream = e.streams[0];
-                if (videoRef.current && stream) {
-                    videoRef.current.srcObject = stream;
-                    videoRef.current.play()
-                        .then(() => { setStreamReady(true); setLoadingStream(false); })
-                        .catch(() => { setStreamReady(true); setLoadingStream(false); });
-                }
-            };
-
-            pc.onicecandidate = (e) => {
-                if (e.candidate) socket.emit("webrtc-ice", { targetId: hostId, candidate: e.candidate });
-            };
-
-            pc.onconnectionstatechange = () => {
-                if (pc.connectionState === "failed") { setLoadingStream(false); setStreamError(true); }
-                if (pc.connectionState === "connected") setLoadingStream(false);
-            };
-
+        function onChunk({ chunk, mimeType, done }) {
+            if (done) { chunkQueueRef.current.push({ done: true }); appendNextChunk(); return; }
             try {
-                await pc.setRemoteDescription(new RTCSessionDescription(offer));
-                const answer = await pc.createAnswer();
-                await pc.setLocalDescription(answer);
-                socket.emit("webrtc-answer", { hostId, answer });
-            } catch (err) {
-                console.error("[WebRTC] Answer error:", err);
-                setLoadingStream(false);
-                setStreamError(true);
-            }
+                const binary = atob(chunk);
+                const bytes = new Uint8Array(binary.length);
+                for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+                chunkQueueRef.current.push({ data: bytes.buffer });
+                appendNextChunk();
+                const v = videoRef.current;
+                if (v && !viewerReady && v.buffered.length > 0 && v.buffered.end(0) > 2) { setViewerReady(true); setViewerLoading(false); }
+            } catch (err) { console.error("Chunk decode error:", err); }
         }
 
-        function onIce({ candidate }) {
-            if (viewerConn.current) viewerConn.current.addIceCandidate(new RTCIceCandidate(candidate)).catch(() => {});
-        }
+        function onSyncPlay({ currentTime }) { const v = videoRef.current; if (!v) return; v.currentTime = currentTime; v.play().then(() => setIsPlaying(true)).catch(() => {}); }
+        function onSyncPause({ currentTime }) { const v = videoRef.current; if (!v) return; v.pause(); v.currentTime = currentTime; setIsPlaying(false); }
+        function onSyncSeek({ currentTime }) { if (videoRef.current) videoRef.current.currentTime = currentTime; }
 
-        function onSyncPlay({ currentTime }) {
-            const v = videoRef.current; if (!v) return;
-            v.currentTime = currentTime;
-            v.play().then(() => setIsPlaying(true)).catch(() => {});
-        }
-
-        function onSyncPause({ currentTime }) {
-            const v = videoRef.current; if (!v) return;
-            v.pause(); v.currentTime = currentTime; setIsPlaying(false);
-        }
-
-        function onSyncSeek({ currentTime }) {
-            if (videoRef.current) videoRef.current.currentTime = currentTime;
-        }
-
-        function onMovieSet({ movieName }) {
-            setMovieName(movieName);
-            setStreamReady(false);
-            setLoadingStream(true);
-            setStreamError(false);
-        }
-
-        function onPeerDisconnected() {
-            if (viewerConn.current) { try { viewerConn.current.close(); } catch (e) {} viewerConn.current = null; }
-            setStreamReady(false); setLoadingStream(false);
-        }
-
-        socket.on("webrtc-offer", onOffer);
-        socket.on("webrtc-ice", onIce);
+        socket.on("movie-set", onMovieSet);
+        socket.on("video-chunk", onChunk);
         socket.on("sync-play", onSyncPlay);
         socket.on("sync-pause", onSyncPause);
         socket.on("sync-seek", onSyncSeek);
-        socket.on("movie-set", onMovieSet);
-        socket.on("peer-disconnected", onPeerDisconnected);
         socket.emit("request-sync");
 
         return () => {
-            socket.off("webrtc-offer", onOffer);
-            socket.off("webrtc-ice", onIce);
-            socket.off("sync-play", onSyncPlay);
-            socket.off("sync-pause", onSyncPause);
-            socket.off("sync-seek", onSyncSeek);
-            socket.off("movie-set", onMovieSet);
-            socket.off("peer-disconnected", onPeerDisconnected);
+            socket.off("movie-set", onMovieSet); socket.off("video-chunk", onChunk);
+            socket.off("sync-play", onSyncPlay); socket.off("sync-pause", onSyncPause); socket.off("sync-seek", onSyncSeek);
         };
     }, [isHost]);
 
-    useEffect(() => () => {
-        Object.values(peerConns.current).forEach((pc) => { try { pc?.close(); } catch (e) {} });
-        if (viewerConn.current) { try { viewerConn.current.close(); } catch (e) {} }
-    }, []);
+    useEffect(() => () => { streamingRef.current = false; }, []);
 
     const progress = duration ? (currentTime / duration) * 100 : 0;
 
@@ -298,55 +205,35 @@ export default function VideoPlayer({ currentUser, currentMovie, onMovieNameSet 
             <div className="text-center">
                 <div style={{ fontSize: 60, marginBottom: 16 }}>📂</div>
                 <div style={{ fontFamily: "'Bebas Neue', sans-serif", fontSize: 26, color: "var(--text-secondary)", letterSpacing: "0.1em" }}>Pick a movie to begin</div>
-                <div style={{ color: "var(--text-secondary)", fontSize: 13, marginTop: 8, marginBottom: 28 }}>Select any video file from your PC</div>
+                <div style={{ color: "var(--text-secondary)", fontSize: 13, marginTop: 8, marginBottom: 28 }}>Select an MP4 or WebM file from your PC</div>
                 <label style={{ display: "inline-block", background: "linear-gradient(135deg, #3b82f6, #6366f1)", color: "#fff", borderRadius: 10, padding: "13px 28px", fontSize: 14, fontWeight: 700, cursor: "pointer", fontFamily: "Syne, sans-serif", boxShadow: "0 8px 24px rgba(59,130,246,0.3)", textTransform: "uppercase", letterSpacing: "0.08em" }}>
                     Choose File
-                    <input type="file" accept="video/*" onChange={handleFilePick} style={{ display: "none" }} />
+                    <input type="file" accept="video/mp4,video/webm" onChange={handleFilePick} style={{ display: "none" }} />
                 </label>
             </div>
         </div>
     );
 
-    if (!isHost && !streamReady) return (
+    if (!isHost && !viewerReady) return (
         <div className="flex items-center justify-center w-full h-full" style={{ background: "#000" }}>
             <div className="text-center">
-                {streamError ? (
-                    <>
-                        <div style={{ fontSize: 48, marginBottom: 16 }}>❌</div>
-                        <div style={{ fontFamily: "'Bebas Neue', sans-serif", fontSize: 22, color: "var(--red)", letterSpacing: "0.1em" }}>Stream failed</div>
-                        <div style={{ color: "var(--text-secondary)", fontSize: 13, marginTop: 8 }}>Ask the host to reload and try again</div>
-                    </>
-                ) : (
-                    <>
-                        <div style={{ fontSize: 48, marginBottom: 16 }}>📡</div>
-                        <div style={{ fontFamily: "'Bebas Neue', sans-serif", fontSize: 22, color: "var(--text-secondary)", letterSpacing: "0.1em" }}>
-                            {loadingStream ? "Connecting to stream..." : "Waiting for host to pick a movie..."}
-                        </div>
-                        {movieName && <div style={{ color: "var(--text-secondary)", fontSize: 13, marginTop: 8 }}>{movieName}</div>}
-                        {loadingStream && <div style={{ color: "var(--text-secondary)", fontSize: 12, marginTop: 10 }}>May take up to 30 seconds on first connect</div>}
-                    </>
-                )}
+                <div style={{ fontSize: 48, marginBottom: 16 }}>📡</div>
+                <div style={{ fontFamily: "'Bebas Neue', sans-serif", fontSize: 22, color: "var(--text-secondary)", letterSpacing: "0.1em" }}>{loadingText}</div>
+                {movieName && <div style={{ color: "var(--text-secondary)", fontSize: 13, marginTop: 8 }}>{movieName}</div>}
+                <div style={{ color: "var(--text-secondary)", fontSize: 12, marginTop: 10 }}>Streaming from host... may take a minute for large files</div>
             </div>
         </div>
     );
 
     return (
         <div className="relative w-full h-full" onMouseMove={handleMouseMove} style={{ background: "#000", cursor: showControls ? "default" : "none" }}>
-            <video ref={videoRef} className="w-full h-full object-contain"
-                   onTimeUpdate={handleTimeUpdate}
-                   onLoadedMetadata={() => setDuration(videoRef.current?.duration || 0)}
-                   onPlay={() => setIsPlaying(true)}
-                   onPause={() => setIsPlaying(false)}
-                   onClick={togglePlay}
-                   playsInline />
-
+            <video ref={videoRef} className="w-full h-full object-contain" onTimeUpdate={handleTimeUpdate} onLoadedMetadata={() => setDuration(videoRef.current?.duration || 0)} onPlay={() => setIsPlaying(true)} onPause={() => setIsPlaying(false)} onClick={togglePlay} playsInline />
             <div style={{ position: "absolute", bottom: 0, left: 0, right: 0, background: "linear-gradient(transparent, rgba(3,7,18,0.96))", padding: "50px 20px 16px", transition: "opacity 0.3s", opacity: showControls ? 1 : 0, pointerEvents: showControls ? "auto" : "none" }}>
                 <div ref={progressRef} onClick={isHost ? handleSeek : undefined} style={{ height: 4, background: "rgba(255,255,255,0.1)", borderRadius: 2, marginBottom: 12, cursor: isHost ? "pointer" : "default", position: "relative" }}>
                     <div style={{ position: "absolute", left: 0, top: 0, height: "100%", width: `${buffered}%`, background: "rgba(255,255,255,0.12)", borderRadius: 2 }} />
                     <div style={{ position: "absolute", left: 0, top: 0, height: "100%", width: `${progress}%`, background: "linear-gradient(90deg, #3b82f6, #6366f1)", borderRadius: 2 }} />
                     {isHost && <div style={{ position: "absolute", top: "50%", left: `${progress}%`, transform: "translate(-50%,-50%)", width: 13, height: 13, borderRadius: "50%", background: "#60a5fa", boxShadow: "0 0 8px #3b82f6" }} />}
                 </div>
-
                 <div className="flex items-center gap-4">
                     {isHost ? (
                         <button onClick={togglePlay} style={{ background: "none", border: "none", color: "white", fontSize: 22, cursor: "pointer", padding: "2px 8px", lineHeight: 1 }}>{isPlaying ? "⏸" : "▶"}</button>
@@ -354,20 +241,18 @@ export default function VideoPlayer({ currentUser, currentMovie, onMovieNameSet 
                         <span style={{ fontSize: 13, opacity: 0.5 }}>👁 Viewing</span>
                     )}
                     <span style={{ color: "rgba(255,255,255,0.7)", fontSize: 13, minWidth: 90 }}>{formatTime(currentTime)} / {formatTime(duration)}</span>
-                    {movieName && <span style={{ fontSize: 12, color: "rgba(255,255,255,0.35)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", maxWidth: 220 }}>{movieName}</span>}
+                    {movieName && <span style={{ fontSize: 12, color: "rgba(255,255,255,0.35)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", maxWidth: 200 }}>{movieName}</span>}
                     <div style={{ flex: 1 }} />
                     {isHost && (
                         <label style={{ fontSize: 11, color: "rgba(255,255,255,0.5)", cursor: "pointer", padding: "4px 10px", borderRadius: 5, border: "1px solid rgba(255,255,255,0.15)", flexShrink: 0 }}>
                             📂 Change
-                            <input type="file" accept="video/*" onChange={handleFilePick} style={{ display: "none" }} />
+                            <input type="file" accept="video/mp4,video/webm" onChange={handleFilePick} style={{ display: "none" }} />
                         </label>
                     )}
                     <button onClick={() => { setMuted((m) => { if (videoRef.current) videoRef.current.muted = !m; return !m; }); }} style={{ background: "none", border: "none", color: "white", fontSize: 16, cursor: "pointer" }}>
                         {muted || volume === 0 ? "🔇" : volume < 0.5 ? "🔉" : "🔊"}
                     </button>
-                    <input type="range" min="0" max="1" step="0.05" value={muted ? 0 : volume}
-                           onChange={(e) => { const v = parseFloat(e.target.value); setVolume(v); if (videoRef.current) videoRef.current.volume = v; setMuted(v === 0); }}
-                           style={{ width: 65, accentColor: "#3b82f6", cursor: "pointer" }} />
+                    <input type="range" min="0" max="1" step="0.05" value={muted ? 0 : volume} onChange={(e) => { const v = parseFloat(e.target.value); setVolume(v); if (videoRef.current) videoRef.current.volume = v; setMuted(v === 0); }} style={{ width: 65, accentColor: "#3b82f6", cursor: "pointer" }} />
                     <button onClick={() => { const el = videoRef.current?.parentElement?.parentElement; if (!el) return; if (!document.fullscreenElement) el.requestFullscreen(); else document.exitFullscreen(); }} style={{ background: "none", border: "none", color: "white", fontSize: 16, cursor: "pointer" }}>⛶</button>
                     {isHost && <span style={{ background: "linear-gradient(135deg,#3b82f6,#6366f1)", color: "#fff", fontSize: 10, fontWeight: 700, padding: "2px 8px", borderRadius: 4, letterSpacing: "0.1em", textTransform: "uppercase" }}>HOST</span>}
                 </div>
