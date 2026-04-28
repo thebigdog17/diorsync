@@ -66,10 +66,15 @@ export default function VideoPlayer({ currentUser, currentMovie, onMovieNameSet 
             const url = URL.createObjectURL(file);
             v.src = url;
             v.load();
-            v.oncanplay = () => {
+            v.onloadeddata = () => {
                 setHostReady(true);
                 setDuration(v.duration || 0);
             };
+            v.onerror = () => {
+                setHostReady(true); // show player anyway so host can see controls
+            };
+// Fallback in case neither fires
+            setTimeout(() => setHostReady(true), 3000);
         }
 
         // Tell everyone
